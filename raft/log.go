@@ -14,7 +14,10 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"github.com/pkg/errors"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -50,13 +53,52 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	nextApplied uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		return nil
+	}
+
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		return nil
+	}
+
+	lastIndex, err := storage.LastIndex()
+	if err != nil {
+		return nil
+	}
+
+	entries, err := storage.Entries(firstIndex, lastIndex+1)
+	if err != nil {
+		return nil
+	}
+
+	snapshot, err := storage.Snapshot()
+	if err != nil {
+		return nil
+	}
+
+	stabled := snapshot.Metadata.Index
+	if len(entries) > 0 {
+		stabled = entries[len(entries)-1].Index
+	}
+
+	l := &RaftLog{
+		storage:         storage,
+		committed:       hardState.Commit,
+		applied:         snapshot.Metadata.Index,
+		stabled:         stabled,
+		entries:         entries,
+		pendingSnapshot: nil,
+	}
+	return l
 }
 
 // We need to compact the log entries in some point of time like
@@ -69,23 +111,151 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	ens, err := l.slice(l.stabled+1, l.LastIndex()+1)
+	if err != nil {
+		return []pb.Entry{}
+	}
+	return ens
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	start := max(l.applied+1, l.firstIndex())
+	if l.applied < l.committed {
+		ents, _ = l.slice(start, l.committed+1)
+	}
+	return
+}
+
+func (l *RaftLog) firstIndex() uint64 {
+	if len(l.entries) == 0 {
+		return 0
+	}
+	return l.entries[0].Index
+}
+
+func (l *RaftLog) matchTerm(i, term uint64) bool {
+	if i == 0 {
+		return true
+	}
+	t, err := l.Term(i)
+	if err != nil {
+		return false
+	}
+	return t == term
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if len(l.entries) == 0 {
+		return 0
+	}
+	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if i == 0 {
+		return 0, nil
+	}
+
+	if i == l.firstIndex()-1 {
+		return l.pendingSnapshot.Metadata.Index, nil
+	}
+
+	if i >= l.firstIndex() && i <= l.LastIndex() {
+		return l.entries[i-l.firstIndex()].Term, nil
+	}
+
+	return 0, errors.New("undefined index")
+}
+
+func (l *RaftLog) append(ents []*pb.Entry) {
+	for _, e := range ents {
+		l.entries = append(l.entries, *e)
+	}
+}
+
+func (l *RaftLog) appendOver(ents []*pb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
+
+	firstIndex := ents[0].Index
+	lastIndex := ents[len(ents)-1].Index
+	lastTerm := ents[len(ents)-1].Term
+	if l.matchTerm(lastIndex, lastTerm) {
+		return
+	}
+
+	if firstIndex <= l.LastIndex() {
+		endIndex := firstIndex - l.firstIndex()
+		l.entries = l.entries[0:endIndex]
+		l.stabled = min(l.stabled, l.LastIndex())
+	}
+
+	for _, e := range ents {
+		l.entries = append(l.entries, *e)
+	}
+}
+
+func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
+	if lo > hi || lo < l.firstIndex() || hi > l.LastIndex()+1 {
+		return []pb.Entry{}, ErrCompacted
+	}
+	if lo == hi {
+		return []pb.Entry{}, nil
+	}
+	lo -= l.firstIndex()
+	hi -= l.firstIndex()
+	return l.entries[lo:hi], nil
+}
+
+func (l *RaftLog) slicePoi(lo, hi uint64) ([]*pb.Entry, error) {
+	if lo > hi || lo < l.firstIndex() || hi > l.LastIndex()+1 {
+		return nil, ErrCompacted
+	}
+
+	lo -= l.firstIndex()
+	hi -= l.firstIndex()
+	ret := make([]*pb.Entry, 0)
+	for i := lo; i < hi; i++ {
+		ret = append(ret, &l.entries[i])
+	}
+	return ret, nil
+}
+
+func (l *RaftLog) stableTo(i uint64) {
+	l.stabled = i
+}
+
+func (l *RaftLog) committedTo(i uint64) {
+	if i <= l.committed {
+		return
+	}
+	l.committed = i
+}
+
+func (l *RaftLog) appliedTo(i uint64) {
+	l.applied = i
+}
+
+func (l *RaftLog) stableSnapTo(i uint64) {
+	if l.pendingSnapshot == nil && l.pendingSnapshot.Metadata.Index == i {
+		l.pendingSnapshot = nil
+	}
+}
+
+func (l *RaftLog) findConflictByTerm(index, term uint64) uint64 {
+	for {
+		logTerm, err := l.Term(index)
+		if logTerm <= term || err != nil {
+			break
+		}
+		index--
+	}
+	return index
 }
