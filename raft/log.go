@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pkg/errors"
 )
@@ -62,30 +63,35 @@ func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	hardState, _, err := storage.InitialState()
 	if err != nil {
-		return nil
+		panic(err)
 	}
 
 	firstIndex, err := storage.FirstIndex()
 	if err != nil {
-		return nil
+		panic(err)
 	}
 
 	lastIndex, err := storage.LastIndex()
 	if err != nil {
-		return nil
+		panic(err)
 	}
+
+	log.Infof("newRaftLog\tfirstIdx:%v\tlastIdx:%v", firstIndex, lastIndex)
 
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
-		return nil
+		panic(err)
 	}
+
+	var stabled uint64 = 0
+	var applied uint64 = 0
 
 	snapshot, err := storage.Snapshot()
-	if err != nil {
-		return nil
+	if err == nil {
+		stabled = snapshot.Metadata.Index
+		applied = snapshot.Metadata.Index
 	}
 
-	stabled := snapshot.Metadata.Index
 	if len(entries) > 0 {
 		stabled = entries[len(entries)-1].Index
 	}
@@ -93,11 +99,14 @@ func newLog(storage Storage) *RaftLog {
 	l := &RaftLog{
 		storage:         storage,
 		committed:       hardState.Commit,
-		applied:         snapshot.Metadata.Index,
+		applied:         applied,
 		stabled:         stabled,
 		entries:         entries,
 		pendingSnapshot: nil,
 	}
+
+	log.Infof("newRaftLog\tlen:%v\tcommitted:%v\tapplied:%v\tstabled:%v\t", len(entries), hardState.Commit, applied, stabled)
+
 	return l
 }
 

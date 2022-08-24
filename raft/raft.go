@@ -172,7 +172,7 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	hardState, _, _ := c.Storage.InitialState()
+	hardState, confState, _ := c.Storage.InitialState()
 
 	r := &Raft{
 		id:               c.ID,
@@ -197,6 +197,15 @@ func newRaft(c *Config) *Raft {
 		r.Prs[id] = &Progress{
 			Match: 0,
 			Next:  r.RaftLog.LastIndex() + 1,
+		}
+	}
+
+	if len(c.peers) == 0 {
+		for _, id := range confState.Nodes {
+			r.Prs[id] = &Progress{
+				Match: 0,
+				Next:  r.RaftLog.LastIndex() + 1,
+			}
 		}
 	}
 
@@ -335,7 +344,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	r.logger.Debugf("sendHeartbeat: to %v", to)
+	r.logger.DebugfX("sendHeartbeat: to %v", to)
 	r.send(pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
@@ -541,7 +550,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.RaftLog.appendOver(m.Entries)
 		msg.Index = r.RaftLog.LastIndex()
 
-		r.RaftLog.committedTo(min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex()))
+		committedIdx := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
+		if committedIdx > r.RaftLog.committed {
+			r.logger.Infof("handleAppendEntries update committed:%v", committedIdx)
+		}
+		r.RaftLog.committedTo(committedIdx)
 
 		r.logger.Debugf("handleAppendEntries r(Idx:%v, T:%v, Len:%v) s(Idx:%v)",
 			m.Index, m.LogTerm, len(m.Entries), r.RaftLog.LastIndex())
@@ -554,7 +567,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		msg.LogTerm, _ = r.RaftLog.Term(index)
 
 		t, _ := r.RaftLog.Term(m.Index)
-		r.logger.Debugf(
+		r.logger.DebugfX(
 			"handleAppendEntries Reject: r(Idx:%v, T:%v : cT:%v) s(Idx:%v, T:%v)",
 			m.Index, m.LogTerm, t, msg.Index, msg.LogTerm)
 	}
@@ -578,7 +591,7 @@ func (r *Raft) handleAppendResp(m pb.Message) {
 		prs.Next = max(1, nextIdx)
 		r.sendAppend(m.From)
 	} else {
-		r.logger.Debugf("handleAppendResp from:%v,  idx:%v", m.From, m.Index)
+		r.logger.DebugfX("handleAppendResp from:%v,  idx:%v", m.From, m.Index)
 
 		prs.Next = max(prs.Next, m.Index+1)
 		prs.Match = max(prs.Match, m.Index)
@@ -642,7 +655,7 @@ func (r *Raft) handleVoteResp(m pb.Message) {
 		}
 
 		if !m.Reject {
-			r.logger.Debugf("收到 %v 的选举同意票", m.From)
+			r.logger.Infof("收到 %v 的选举同意票", m.From)
 		} else {
 			r.logger.DebugfX("收到 %v 的选举回复", m.From)
 		}
@@ -699,7 +712,7 @@ func (r *Raft) maybeCommit() bool {
 	})
 	newCommit := match[len(match)/2]
 	if newCommit != 0 && r.RaftLog.matchTerm(newCommit, r.Term) && newCommit > r.RaftLog.committed {
-		r.logger.Debugf("maybeCommit update committedTo %v", newCommit)
+		r.logger.Infof("maybeCommit update committedTo %v", newCommit)
 		r.RaftLog.committedTo(newCommit)
 		return true
 	}

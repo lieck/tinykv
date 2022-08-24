@@ -308,10 +308,28 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+
+	// 追加/覆盖日志
+	for _, e := range entries {
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, e.Index), &e); err != nil {
+			return err
+		}
+	}
+
+	// 删除没有覆盖到的日志
+	last := entries[len(entries)-1]
+	for i := last.Index + 1; i <= ps.raftState.LastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+
+	log.Infof("%v\tAppend\tlen:%v\tlastTerm:%v\tlastIdx:%v", ps.Tag, len(entries), last.Term, last.Index)
+
+	ps.raftState.LastTerm = last.Term
+	ps.raftState.LastIndex = last.Index
 	return nil
 }
 
-// Apply the peer with given snapshot
+// ApplySnapshot Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
@@ -326,11 +344,47 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	return nil, nil
 }
 
-// Save memory states to disk.
+// SaveReadyState Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	kvWB := engine_util.WriteBatch{}
+	raftWB := engine_util.WriteBatch{}
+
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		_, err := ps.ApplySnapshot(&ready.Snapshot, &kvWB, &raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(ready.Entries) > 0 {
+		if err := ps.Append(ready.Entries, &raftWB); err != nil {
+			return nil, err
+		}
+	}
+
+	//if len(ready.CommittedEntries) > 0 {
+	//	ps.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries) - 1].Index
+	//	log.Infof("SaveReadyState\tapplyIdx:%v", ps.applyState.AppliedIndex)
+	//}
+
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+		log.Infof("%v\tSaveReadyState\tcommIdx:%v", ps.Tag, ps.raftState.HardState.Commit)
+		if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 

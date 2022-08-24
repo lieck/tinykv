@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -159,6 +160,7 @@ func (rn *RawNode) Ready() Ready {
 		Entries:          r.RaftLog.unstableEntries(),
 		CommittedEntries: r.RaftLog.nextEnts(),
 	}
+	log.Debugf("Ready CommittedEntries len:%v", len(rd.CommittedEntries))
 
 	if softSt := r.sortState(); rn.prevSoftSt == nil || !softSt.equal(rn.prevSoftSt) {
 		rd.SoftState = softSt
@@ -166,6 +168,7 @@ func (rn *RawNode) Ready() Ready {
 	}
 	if hardSt := r.hardState(); !isHardStateEqual(hardSt, rn.prevHardSt) {
 		rd.HardState = hardSt
+		rn.prevHardSt = hardSt
 	}
 
 	if r.RaftLog.pendingSnapshot != nil {
