@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
@@ -129,12 +130,21 @@ func (d *peerMsgHandler) applyEntries(ens []pb.Entry) {
 			}
 
 		} else { // 特殊请求
-
+			switch msg.AdminRequest.CmdType {
+			case raft_cmdpb.AdminCmdType_CompactLog:
+				d.peerStorage.applyState.TruncatedState.Index = msg.AdminRequest.CompactLog.CompactIndex
+				d.peerStorage.applyState.TruncatedState.Term = msg.AdminRequest.CompactLog.CompactTerm
+				log.Infof("%v\tapplyEntries AdminCmdType_CompactLog", d.Tag)
+				d.ScheduleCompactLog(msg.AdminRequest.CompactLog.CompactIndex)
+			}
 		}
 	}
 
 	if len(ens) > 0 {
 		d.peerStorage.applyState.AppliedIndex = ens[len(ens)-1].Index
+		if err := engine_util.PutMeta(d.peerStorage.Engines.Kv, meta.ApplyStateKey(d.peerStorage.Region().Id), d.peerStorage.applyState); err != nil {
+			panic(err)
+		}
 		log.Infof("%v\tapplyEntries\tapplyIdx:%v", d.Tag, ens[len(ens)-1].Index)
 	}
 }
@@ -149,7 +159,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 		d.Send(d.ctx.trans, rd.Messages)
 
-		if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+		_, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
 			panic(err)
 		}
 

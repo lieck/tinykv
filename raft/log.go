@@ -55,6 +55,9 @@ type RaftLog struct {
 
 	// Your Data Here (2A).
 	nextApplied uint64
+
+	snapshotIndex uint64
+	snapshotTerm  uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -76,36 +79,29 @@ func newLog(storage Storage) *RaftLog {
 		panic(err)
 	}
 
-	log.Infof("newRaftLog\tfirstIdx:%v\tlastIdx:%v", firstIndex, lastIndex)
-
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
-		panic(err)
+		entries = []pb.Entry{}
 	}
 
-	var stabled uint64 = 0
-	var applied uint64 = 0
-
-	snapshot, err := storage.Snapshot()
-	if err == nil {
-		stabled = snapshot.Metadata.Index
-		applied = snapshot.Metadata.Index
+	var snapshotIndex uint64 = 0
+	var snapshotTerm uint64 = 0
+	if lastIndex > 1 {
+		snapshotIndex = firstIndex - 1
+		snapshotTerm, _ = storage.Term(snapshotIndex)
 	}
 
-	if len(entries) > 0 {
-		stabled = entries[len(entries)-1].Index
-	}
+	log.Infof("newRaftLog\tfirstIdx:%v\tlastIdx:%v\tsnapIdx:%v\tlen:%v", firstIndex, lastIndex, snapshotIndex, len(entries))
 
 	l := &RaftLog{
-		storage:         storage,
-		committed:       hardState.Commit,
-		applied:         applied,
-		stabled:         stabled,
-		entries:         entries,
-		pendingSnapshot: nil,
+		storage:       storage,
+		committed:     hardState.Commit,
+		applied:       snapshotIndex,
+		stabled:       lastIndex,
+		entries:       entries,
+		snapshotTerm:  snapshotTerm,
+		snapshotIndex: snapshotIndex,
 	}
-
-	log.Infof("newRaftLog\tlen:%v\tcommitted:%v\tapplied:%v\tstabled:%v\t", len(entries), hardState.Commit, applied, stabled)
 
 	return l
 }
@@ -115,6 +111,18 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	if l.pendingSnapshot == nil {
+		panic("maybeCompact pendingSnapshot nil")
+	}
+	metaData := l.pendingSnapshot.Metadata
+	l.snapshotIndex = metaData.Index
+	l.snapshotTerm = metaData.Term
+
+	l.committed = metaData.Index
+	l.applied = metaData.Index
+	l.stabled = metaData.Index
+
+	l.entries = []pb.Entry{}
 }
 
 // unstableEntries return all the unstable entries
@@ -159,7 +167,7 @@ func (l *RaftLog) matchTerm(i, term uint64) bool {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
-		return 0
+		return l.snapshotIndex
 	}
 	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
@@ -171,11 +179,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, nil
 	}
 
-	if i == l.firstIndex()-1 {
-		return l.pendingSnapshot.Metadata.Index, nil
+	if i == l.snapshotIndex {
+		return l.snapshotTerm, nil
 	}
 
-	if i >= l.firstIndex() && i <= l.LastIndex() {
+	if len(l.entries) > 0 && i >= l.firstIndex() && i <= l.LastIndex() {
 		return l.entries[i-l.firstIndex()].Term, nil
 	}
 
@@ -196,10 +204,19 @@ func (l *RaftLog) appendOver(ents []*pb.Entry) {
 	firstIndex := ents[0].Index
 	lastIndex := ents[len(ents)-1].Index
 	lastTerm := ents[len(ents)-1].Term
-	if l.matchTerm(lastIndex, lastTerm) {
+
+	if lastIndex <= l.committed || l.matchTerm(lastIndex, lastTerm) {
 		return
 	}
 
+	// 去掉 ents 内 committed 之前的日志
+	if firstIndex <= l.committed {
+		startIdx := l.committed - firstIndex + 1
+		ents = ents[startIdx:]
+		firstIndex = ents[0].Index
+	}
+
+	// 去掉 l.entries 被覆盖的日志
 	if firstIndex <= l.LastIndex() {
 		endIndex := firstIndex - l.firstIndex()
 		l.entries = l.entries[0:endIndex]
@@ -212,7 +229,7 @@ func (l *RaftLog) appendOver(ents []*pb.Entry) {
 }
 
 func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
-	if lo > hi || lo < l.firstIndex() || hi > l.LastIndex()+1 {
+	if lo > hi || lo < l.firstIndex() || hi > l.LastIndex()+1 || lo <= l.snapshotIndex {
 		return []pb.Entry{}, ErrCompacted
 	}
 	if lo == hi {
@@ -224,7 +241,7 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 }
 
 func (l *RaftLog) slicePoi(lo, hi uint64) ([]*pb.Entry, error) {
-	if lo > hi || lo < l.firstIndex() || hi > l.LastIndex()+1 {
+	if lo > hi || lo < l.firstIndex() || hi > l.LastIndex()+1 || lo <= l.snapshotIndex {
 		return nil, ErrCompacted
 	}
 
@@ -253,7 +270,7 @@ func (l *RaftLog) appliedTo(i uint64) {
 }
 
 func (l *RaftLog) stableSnapTo(i uint64) {
-	if l.pendingSnapshot == nil && l.pendingSnapshot.Metadata.Index == i {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
 		l.pendingSnapshot = nil
 	}
 }

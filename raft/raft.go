@@ -287,7 +287,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	nextIndex := r.Prs[to].Next
 	preLogIndex := r.Prs[to].Next - 1
-	if nextIndex < r.RaftLog.firstIndex() {
+	if nextIndex <= r.RaftLog.snapshotIndex {
 
 		msg.MsgType = pb.MessageType_MsgSnapshot
 		snapshot, err := r.RaftLog.storage.Snapshot()
@@ -303,13 +303,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 		if preLogIndex == 0 {
 			msg.LogTerm = r.Term
-		} else if preLogIndex != 0 && preLogIndex+1 == r.RaftLog.firstIndex() {
-			snapshot, err := r.RaftLog.storage.Snapshot()
-			if err != nil {
-				r.logger.Warningf("sendAppend: 无法获取 PreLogTerm, Index(%v) 快照错误", preLogIndex)
-				return false
-			}
-			msg.LogTerm = snapshot.Metadata.Term
 		} else {
 			term, err := r.RaftLog.Term(preLogIndex)
 			if err == nil {
@@ -624,7 +617,25 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	msg := pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From}
+	metaData := m.Snapshot.Metadata
 
+	if r.RaftLog.LastIndex() < metaData.Index || !r.RaftLog.matchTerm(metaData.Index, metaData.Term) {
+		r.RaftLog.pendingSnapshot = m.Snapshot
+		r.RaftLog.maybeCompact()
+
+		r.Prs = map[uint64]*Progress{}
+		for _, id := range metaData.ConfState.Nodes {
+			r.Prs[id] = &Progress{}
+		}
+	}
+
+	msg.Index = r.RaftLog.LastIndex()
+
+	r.logger.Debugf("handleSnapshot r(Idx:%v, T:%v) s(Idx:%v)",
+		metaData.Index, metaData.Term, r.RaftLog.LastIndex())
+
+	r.send(msg)
 }
 
 func (r *Raft) handleVote(m pb.Message) {

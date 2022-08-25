@@ -268,6 +268,8 @@ func LogTypeToString(t LogType) (string, string) {
 }
 
 func New() *Logger {
+	//var writer bytes.Buffer
+	//return NewLogger(&writer, "")
 	return NewLogger(os.Stderr, "")
 }
 
