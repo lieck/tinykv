@@ -41,102 +41,153 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
-func (d *peerMsgHandler) applyEntries(ens []pb.Entry) {
-	for _, e := range ens {
-		if e.Data == nil {
-			continue
-		}
+func (d *peerMsgHandler) applyEntryNormal(e pb.Entry) {
+	if e.Data == nil {
+		return
+	}
 
-		msg := raft_cmdpb.RaftCmdRequest{}
-		if err := msg.Unmarshal(e.Data); err != nil {
-			log.Panic(err)
-		}
+	msg := raft_cmdpb.RaftCmdRequest{}
+	if err := msg.Unmarshal(e.Data); err != nil {
+		log.Panic(err)
+	}
 
-		if len(msg.Requests) > 0 { // 普通请求
-			var isResp bool = false
-			for len(d.proposals) > 0 {
-				p := d.proposals[0]
+	if len(msg.Requests) > 0 { // 普通请求
+		var isResp bool = false
+		for len(d.proposals) > 0 {
+			p := d.proposals[0]
 
-				if e.Term > p.term {
-					p.cb.Done(ErrRespStaleCommand(p.term))
-					d.proposals = d.proposals[1:]
-					continue
-				}
-
-				if e.Term == p.term && e.Index > p.index {
-					p.cb.Done(ErrRespStaleCommand(p.term))
-					d.proposals = d.proposals[1:]
-					continue
-				}
-
-				isResp = e.Term == p.term && e.Index == p.index
-				break
+			if e.Term > p.term {
+				p.cb.Done(ErrRespStaleCommand(p.term))
+				d.proposals = d.proposals[1:]
+				continue
 			}
 
-			kvWB := engine_util.WriteBatch{}
-			resp := raft_cmdpb.RaftCmdResponse{}
-
-			for _, r := range msg.Requests {
-				rr := raft_cmdpb.Response{}
-				rr.CmdType = r.CmdType
-
-				switch r.CmdType {
-				case raft_cmdpb.CmdType_Put:
-					kvWB.SetCF(r.Put.Cf, r.Put.Key, r.Put.Value)
-					log.Infof("%v\tapplyEntries idx:%v\tPUT\tkey:%v\tval:%v", d.Tag, e.Index, string(r.Put.Key), string(r.Put.Value))
-				case raft_cmdpb.CmdType_Delete:
-					kvWB.DeleteCF(r.Delete.Cf, r.Delete.Key)
-					log.Infof("%v\tapplyEntries idx:%v\tDEL\tkey:%v", d.Tag, e.Index, string(r.Delete.Key))
-				case raft_cmdpb.CmdType_Snap:
-				}
-
-				if isResp {
-					switch r.CmdType {
-					case raft_cmdpb.CmdType_Put:
-						rr.Put = &raft_cmdpb.PutResponse{}
-					case raft_cmdpb.CmdType_Delete:
-						rr.Delete = &raft_cmdpb.DeleteResponse{}
-					case raft_cmdpb.CmdType_Snap:
-						rr.CmdType = raft_cmdpb.CmdType_Snap
-						rr.Snap = &raft_cmdpb.SnapResponse{
-							Region: d.Region(),
-						}
-						d.proposals[0].cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-					case raft_cmdpb.CmdType_Get:
-						val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, r.Get.Cf, r.Get.Key)
-						rr.Get = &raft_cmdpb.GetResponse{Value: val}
-					}
-
-					resp.Responses = append(resp.Responses, &rr)
-				}
+			if e.Term == p.term && e.Index > p.index {
+				p.cb.Done(ErrRespStaleCommand(p.term))
+				d.proposals = d.proposals[1:]
+				continue
 			}
 
-			if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
-				log.Panic(err)
+			isResp = e.Term == p.term && e.Index == p.index
+			break
+		}
+
+		kvWB := engine_util.WriteBatch{}
+		resp := raft_cmdpb.RaftCmdResponse{}
+
+		for _, r := range msg.Requests {
+			rr := raft_cmdpb.Response{}
+			rr.CmdType = r.CmdType
+
+			switch r.CmdType {
+			case raft_cmdpb.CmdType_Put:
+				kvWB.SetCF(r.Put.Cf, r.Put.Key, r.Put.Value)
+				log.Infof("%v\tapplyEntries idx:%v\tPUT\tkey:%v\tval:%v", d.Tag, e.Index, string(r.Put.Key), string(r.Put.Value))
+			case raft_cmdpb.CmdType_Delete:
+				kvWB.DeleteCF(r.Delete.Cf, r.Delete.Key)
+				log.Infof("%v\tapplyEntries idx:%v\tDEL\tkey:%v", d.Tag, e.Index, string(r.Delete.Key))
+			case raft_cmdpb.CmdType_Snap:
 			}
 
 			if isResp {
-				resp.Header = &raft_cmdpb.RaftResponseHeader{
-					Error:       nil,
-					Uuid:        nil,
-					CurrentTerm: d.Term(),
+				switch r.CmdType {
+				case raft_cmdpb.CmdType_Put:
+					rr.Put = &raft_cmdpb.PutResponse{}
+				case raft_cmdpb.CmdType_Delete:
+					rr.Delete = &raft_cmdpb.DeleteResponse{}
+				case raft_cmdpb.CmdType_Snap:
+					rr.CmdType = raft_cmdpb.CmdType_Snap
+					rr.Snap = &raft_cmdpb.SnapResponse{
+						Region: d.Region(),
+					}
+					d.proposals[0].cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				case raft_cmdpb.CmdType_Get:
+					val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, r.Get.Cf, r.Get.Key)
+					rr.Get = &raft_cmdpb.GetResponse{Value: val}
 				}
 
-				p := d.proposals[0]
-				p.cb.Done(&resp)
-				d.proposals = d.proposals[1:]
+				resp.Responses = append(resp.Responses, &rr)
+			}
+		}
 
-				log.Infof("%v\tapplyEntries Resp\tidx:%v\tterm:%v\ttype:%v", d.Tag, p.index, p.term, resp.Responses[0].CmdType)
+		if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+			log.Panic(err)
+		}
+
+		if isResp {
+			resp.Header = &raft_cmdpb.RaftResponseHeader{
+				Error:       nil,
+				Uuid:        nil,
+				CurrentTerm: d.Term(),
 			}
 
-		} else { // 特殊请求
-			switch msg.AdminRequest.CmdType {
-			case raft_cmdpb.AdminCmdType_CompactLog:
-				d.peerStorage.applyState.TruncatedState.Index = msg.AdminRequest.CompactLog.CompactIndex
-				d.peerStorage.applyState.TruncatedState.Term = msg.AdminRequest.CompactLog.CompactTerm
-				log.Infof("%v\tapplyEntries AdminCmdType_CompactLog", d.Tag)
-				d.ScheduleCompactLog(msg.AdminRequest.CompactLog.CompactIndex)
+			p := d.proposals[0]
+			p.cb.Done(&resp)
+			d.proposals = d.proposals[1:]
+
+			log.Infof("%v\tapplyEntries Resp\tidx:%v\tterm:%v\ttype:%v", d.Tag, p.index, p.term, resp.Responses[0].CmdType)
+		}
+
+	} else { // 特殊请求
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			d.peerStorage.applyState.TruncatedState.Index = msg.AdminRequest.CompactLog.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = msg.AdminRequest.CompactLog.CompactTerm
+			log.Infof("%v\tapplyEntries AdminCmdType_CompactLog", d.Tag)
+			d.ScheduleCompactLog(msg.AdminRequest.CompactLog.CompactIndex)
+		}
+	}
+}
+
+func (d *peerMsgHandler) applyEntryConfChange(e pb.Entry) {
+	cc := pb.ConfChange{}
+	if err := cc.Unmarshal(e.Data); err != nil {
+		log.Panic(err)
+	}
+
+	region := d.Region()
+	region.RegionEpoch.ConfVer++
+
+	switch cc.ChangeType {
+	case pb.ConfChangeType_AddNode:
+		peer := metapb.Peer{
+			Id:      cc.NodeId,
+			StoreId: 0,
+		}
+		region.Peers = append(region.Peers, &peer)
+		d.insertPeerCache(&peer)
+	case pb.ConfChangeType_RemoveNode:
+		if cc.NodeId == d.regionId {
+			d.destroyPeer()
+			return
+		}
+
+		var peers []*metapb.Peer
+		for _, p := range region.Peers {
+			if p.Id == cc.NodeId {
+				continue
 			}
+			peers = append(peers, p)
+		}
+		d.removePeerCache(cc.NodeId)
+	}
+
+	kvBW := engine_util.WriteBatch{}
+	meta.WriteRegionState(&kvBW, region, rspb.PeerState_Normal)
+	if err := kvBW.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+		log.Panic(err)
+	}
+
+	d.RaftGroup.ApplyConfChange(cc)
+}
+
+func (d *peerMsgHandler) applyEntries(ens []pb.Entry) {
+	for _, e := range ens {
+		switch e.EntryType {
+		case pb.EntryType_EntryNormal:
+			d.applyEntryNormal(e)
+		case pb.EntryType_EntryConfChange:
+			d.applyEntryConfChange(e)
 		}
 	}
 

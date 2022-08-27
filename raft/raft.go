@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 	"math/rand"
 	"sort"
 
@@ -347,6 +348,22 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	})
 }
 
+func (r *Raft) sendTransferLeader(to uint64) {
+	p, ok := r.Prs[to]
+	if !ok {
+		r.leadTransferee = None
+		return
+	}
+	if p.Match != r.RaftLog.LastIndex() {
+		r.sendAppend(to)
+		return
+	}
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		To:      to,
+	})
+}
+
 func (r *Raft) hup() {
 	r.becomeCandidate()
 
@@ -440,6 +457,13 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	if _, ok := r.Prs[r.id]; !ok {
+		log.Infof("becomeLeader Prs 内不存在 %v", r.id)
+		r.becomeFollower(r.Term, None)
+		return
+	}
+
+	r.leadTransferee = None
 	r.State = StateLeader
 	r.reset(r.Term, r.id)
 
@@ -509,6 +533,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleSnapshot(m)
 		case pb.MessageType_MsgHeartbeat:
 			r.handleHeartbeat(m)
+		case pb.MessageType_MsgTimeoutNow:
+			r.hup()
 		}
 	}
 
@@ -524,11 +550,23 @@ func (r *Raft) Step(m pb.Message) error {
 				r.sendHeartbeat(id)
 			}
 		case pb.MessageType_MsgPropose:
+			if r.leadTransferee != 0 {
+				return ErrProposalDropped
+			}
 			r.appendEntry(m.Entries)
+		case pb.MessageType_MsgTransferLeader:
+			r.logger.Infof("Step TransferLeader:%v", m.From)
+			if m.From == r.id {
+				return nil
+			}
+			r.leadTransferee = m.From
+			r.sendTransferLeader(m.From)
 		}
 	default:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
+			r.hup()
+		case pb.MessageType_MsgTransferLeader:
 			r.hup()
 		}
 	}
@@ -597,7 +635,14 @@ func (r *Raft) handleAppendResp(m pb.Message) {
 				r.sendAppend(i)
 			}
 		} else if r.Prs[m.From].Next <= r.RaftLog.LastIndex() {
-			r.sendAppend(m.From)
+			if _, ok := r.Prs[m.From]; ok {
+				r.sendAppend(m.From)
+			}
+		}
+
+		// 日志满足转移 Leader 的条件，开始转移
+		if r.leadTransferee != None && r.leadTransferee == m.From && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+			r.sendTransferLeader(r.leadTransferee)
 		}
 	}
 }
@@ -690,11 +735,20 @@ func (r *Raft) handleVoteResp(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	log.Infof("Raft Add Node:%v", id)
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	log.Infof("Raft Remove Node:%v", id)
+	delete(r.Prs, id)
+	delete(r.votes, id)
+	r.maybeCommit()
 }
 
 func (r *Raft) advance(rd Ready) {
@@ -718,6 +772,11 @@ func (r *Raft) maybeCommit() bool {
 	for _, p := range r.Prs {
 		match = append(match, p.Match)
 	}
+
+	if len(match) == 0 {
+		return false
+	}
+
 	sort.Slice(match, func(i, j int) bool {
 		return match[i] > match[j]
 	})
