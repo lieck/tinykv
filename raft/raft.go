@@ -16,11 +16,12 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
 	"sort"
-
-	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"strconv"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -210,9 +211,24 @@ func newRaft(c *Config) *Raft {
 		}
 	}
 
-	r.logger.Infof("new raft lastIndex:%v", r.RaftLog.LastIndex())
+	r.checkPendingConfIndex()
+
+	r.logger.Infof("new raft lastIndex:%v\tsnapshotIndex:%v", r.RaftLog.LastIndex(), r.RaftLog.snapshotIndex)
 
 	return r
+}
+
+func (r *Raft) checkPendingConfIndex() {
+	r.PendingConfIndex = None
+	ent, err := r.RaftLog.slice(max(r.RaftLog.firstIndex(), r.RaftLog.applied+1), r.RaftLog.LastIndex()+1)
+	if err == nil {
+		for _, e := range ent {
+			if e.EntryType == pb.EntryType_EntryConfChange {
+				r.PendingConfIndex = e.Index
+				break
+			}
+		}
+	}
 }
 
 func (r *Raft) sortState() *SoftState {
@@ -283,7 +299,6 @@ func (r *Raft) send(m pb.Message) {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	r.logger.DebugfX("sendAppend to %v", to)
 	msg := pb.Message{To: to}
 
 	nextIndex := r.Prs[to].Next
@@ -293,11 +308,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 		msg.MsgType = pb.MessageType_MsgSnapshot
 		snapshot, err := r.RaftLog.storage.Snapshot()
 		if err != nil {
-			r.logger.Debugf("sendAppend: 发送至 %v 的快照未准备好", to)
 			return false
 		}
 		msg.Snapshot = &snapshot
-
+		log.Infof("Raft:%v\tsend Snapshot Metadata: %v\tTo:%v", r.id, msg.Snapshot.Metadata.String(), to)
 	} else {
 
 		msg.MsgType = pb.MessageType_MsgAppend
@@ -309,26 +323,28 @@ func (r *Raft) sendAppend(to uint64) bool {
 			if err == nil {
 				msg.LogTerm = term
 			} else {
-				r.logger.Warningf("sendAppend: 无法获取 PreLogTerm, Index(%v) 错误", preLogIndex)
 				return false
 			}
 		}
 
 		msg.Index = preLogIndex
-
-		msg.Commit = r.RaftLog.committed
-
 		ens, err := r.RaftLog.slicePoi(nextIndex, r.RaftLog.LastIndex()+1)
 		if err != nil {
-			r.logger.Warningf("sendAppend: 获取日志错误 [%v, %v]", nextIndex, r.RaftLog.LastIndex())
 			return false
 		}
 		msg.Entries = ens
 
 		if len(msg.Entries) == 0 && msg.Index == 0 {
-			r.logger.Warning("不包含任何有效信息")
 			return false
 		}
+
+		var msgLastIdx uint64
+		if len(msg.Entries) > 0 {
+			msgLastIdx = msg.Entries[len(msg.Entries)-1].Index
+		}
+		msg.Commit = min(r.RaftLog.committed, max(r.Prs[to].Match, msgLastIdx))
+
+		log.Infof("Raft:%v\tsend Append\tIdx:%v\tTerm:%v\tLen:%v\tCommIdx:%v", r.id, msg.Index, msg.LogTerm, len(msg.Entries), msg.Commit)
 	}
 
 	r.send(msg)
@@ -339,16 +355,18 @@ func (r *Raft) sendAppend(to uint64) bool {
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
 	r.logger.DebugfX("sendHeartbeat: to %v", to)
+	commit := min(r.RaftLog.committed, r.Prs[to].Match)
 	r.send(pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
+		Commit:  commit,
 	})
 }
 
 func (r *Raft) sendTransferLeader(to uint64) {
+	//r.logger.Infof("sendTransferLeader", to)
 	p, ok := r.Prs[to]
 	if !ok {
 		r.leadTransferee = None
@@ -365,6 +383,10 @@ func (r *Raft) sendTransferLeader(to uint64) {
 }
 
 func (r *Raft) hup() {
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
+
 	r.becomeCandidate()
 
 	// 单节点状态下选举
@@ -375,8 +397,6 @@ func (r *Raft) hup() {
 
 	// 发送选举信息
 	logTerm, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
-
-	r.logger.Debug("发起选举")
 
 	for id, _ := range r.Prs {
 		if id == r.id {
@@ -390,7 +410,6 @@ func (r *Raft) hup() {
 			LogTerm: logTerm,
 			Index:   r.RaftLog.LastIndex(),
 		})
-		r.logger.DebugfX("send hub %v", id)
 	}
 }
 
@@ -428,6 +447,9 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Lead = lead
 
+	r.leadTransferee = None
+	r.PendingConfIndex = None
+
 	r.reset(term, lead)
 
 	r.electionElapsed = 0
@@ -450,7 +472,12 @@ func (r *Raft) becomeCandidate() {
 	r.votesGranted = 1
 	r.votesRejected = 0
 
-	r.logger.Info("becomeCandidate")
+	peers := ""
+	for id := range r.Prs {
+		peers += strconv.FormatUint(id, 10) + " "
+	}
+
+	log.Infof("Raft:%v\tbecomeCandidate\tPeers:%v", r.id, peers)
 }
 
 // becomeLeader transform this peer's state to leader
@@ -476,7 +503,13 @@ func (r *Raft) becomeLeader() {
 	// no-op 日志
 	r.appendEntry([]*pb.Entry{&pb.Entry{}})
 
-	r.logger.Info("becomeLeader")
+	r.checkPendingConfIndex()
+
+	peers := ""
+	for id := range r.Prs {
+		peers += strconv.FormatUint(id, 10) + " "
+	}
+	log.Infof("Raft:%v\tbecomeLeader\tTerm:%v\tent(%v:%v)\tPeers:%v", r.id, r.Term, r.RaftLog.LastIndex(), r.RaftLog.LastIndex(), peers)
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -500,6 +533,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.becomeFollower(m.Term, m.From)
 		}
 	case m.Term < r.Term:
+		// 回复让 Leader 下线
+		r.send(pb.Message{MsgType: pb.MessageType_MsgHeartbeatResponse, To: m.From})
 		return nil
 	}
 
@@ -550,12 +585,11 @@ func (r *Raft) Step(m pb.Message) error {
 				r.sendHeartbeat(id)
 			}
 		case pb.MessageType_MsgPropose:
-			if r.leadTransferee != 0 {
+			if r.leadTransferee != None {
 				return ErrProposalDropped
 			}
 			r.appendEntry(m.Entries)
 		case pb.MessageType_MsgTransferLeader:
-			r.logger.Infof("Step TransferLeader:%v", m.From)
 			if m.From == r.id {
 				return nil
 			}
@@ -577,18 +611,15 @@ func (r *Raft) Step(m pb.Message) error {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	msg := pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From}
-	if r.RaftLog.matchTerm(m.Index, m.LogTerm) {
+	if m.Index < r.RaftLog.snapshotIndex || r.RaftLog.matchTerm(m.Index, m.LogTerm) {
 		r.RaftLog.appendOver(m.Entries)
 		msg.Index = r.RaftLog.LastIndex()
 
-		committedIdx := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
-		if committedIdx > r.RaftLog.committed {
-			r.logger.Infof("handleAppendEntries update committed:%v", committedIdx)
-		}
+		committedIdx := min(m.Commit, r.RaftLog.LastIndex())
 		r.RaftLog.committedTo(committedIdx)
 
-		r.logger.Debugf("handleAppendEntries r(Idx:%v, T:%v, Len:%v) s(Idx:%v)",
-			m.Index, m.LogTerm, len(m.Entries), r.RaftLog.LastIndex())
+		log.Infof("Raft:%v\thandleAppendEntries r(Idx:%v, T:%v, Len:%v) s(Idx:%v) cuurCom:%v", r.id,
+			m.Index, m.LogTerm, len(m.Entries), r.RaftLog.LastIndex(), r.RaftLog.committed)
 
 	} else {
 		msg.Reject = true
@@ -598,8 +629,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		msg.LogTerm, _ = r.RaftLog.Term(index)
 
 		t, _ := r.RaftLog.Term(m.Index)
-		r.logger.DebugfX(
-			"handleAppendEntries Reject: r(Idx:%v, T:%v : cT:%v) s(Idx:%v, T:%v)",
+		log.Infof(
+			"Raft:%v\thandleAppendEntries Reject: r(Idx:%v, T:%v : cT:%v) s(Idx:%v, T:%v)", r.id,
 			m.Index, m.LogTerm, t, msg.Index, msg.LogTerm)
 	}
 
@@ -607,9 +638,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 }
 
 func (r *Raft) handleAppendResp(m pb.Message) {
-	prs := r.Prs[m.From]
+	r.logger.Infof("handleAppendResp\tfrom:%v", m.From)
+	prs, ok := r.Prs[m.From]
+	if !ok {
+		return
+	}
 	if m.Reject {
-		nextIdx := m.Index
+		nextIdx := m.Index + 1
 
 		if nextIdx != 0 && nextIdx <= prs.Match {
 			return
@@ -622,7 +657,9 @@ func (r *Raft) handleAppendResp(m pb.Message) {
 		prs.Next = max(1, nextIdx)
 		r.sendAppend(m.From)
 	} else {
-		r.logger.DebugfX("handleAppendResp from:%v,  idx:%v", m.From, m.Index)
+		// 判断是否为已删除节点的过期信息
+
+		log.Infof("Raft:%v\thandleAppendResp from:%v,  idx:%v", r.id, m.From, m.Index)
 
 		prs.Next = max(prs.Next, m.Index+1)
 		prs.Match = max(prs.Match, m.Index)
@@ -651,6 +688,9 @@ func (r *Raft) handleAppendResp(m pb.Message) {
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
 	r.electionElapsed = 0
+	if m.Commit != util.RaftInvalidIndex {
+		r.RaftLog.committedTo(min(m.Commit, r.RaftLog.LastIndex()))
+	}
 
 	r.send(pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
@@ -673,11 +713,13 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		for _, id := range metaData.ConfState.Nodes {
 			r.Prs[id] = &Progress{}
 		}
+
+		log.Infof("Raft:%v\tApplySnapshot metaData:%v\tcurrLastIdx:%v", r.id, metaData.String(), r.RaftLog.snapshotIndex)
 	}
 
 	msg.Index = r.RaftLog.LastIndex()
 
-	r.logger.Debugf("handleSnapshot r(Idx:%v, T:%v) s(Idx:%v)",
+	log.Infof("Raft:%v\thandleSnapshot r(Idx:%v, T:%v) s(Idx:%v)", r.id,
 		metaData.Index, metaData.Term, r.RaftLog.LastIndex())
 
 	r.send(msg)
@@ -695,14 +737,17 @@ func (r *Raft) handleVote(m pb.Message) {
 			r.Vote = m.From
 			r.logger.Debugf("投票至 %v", r.Vote)
 		}
+
+		log.Infof("Raft:%v\tVote\tr(id:%v, Term:%v, Idx:%v, logTerm:%v)\tcurrLast(Idx:%v, Term:%v)\tisVote:%v", r.id, m.From, m.Term, m.Index, m.LogTerm,
+			r.RaftLog.LastIndex(), currLogTerm, isVote)
 	}
+
 	msg.Reject = !isVote
 	r.send(msg)
 }
 
 func (r *Raft) handleVoteResp(m pb.Message) {
 	if _, ok := r.votes[m.From]; m.Term == r.Term && !ok {
-
 		r.votes[m.From] = !m.Reject
 		if m.Reject {
 			r.votesRejected++
@@ -735,19 +780,22 @@ func (r *Raft) handleVoteResp(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
-	log.Infof("Raft Add Node:%v", id)
 	r.Prs[id] = &Progress{
-		Match: 0,
+		Match: util.RaftInvalidIndex,
 		Next:  r.RaftLog.LastIndex() + 1,
 	}
+	r.PendingConfIndex = None
+	_ = r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+	r.logger.Infof("Raft add Node:%v\tpeer num:%v", id, len(r.Prs))
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
-	log.Infof("Raft Remove Node:%v", id)
 	delete(r.Prs, id)
 	delete(r.votes, id)
+	r.PendingConfIndex = None
+	r.logger.Infof("Raft Remove Node:%v\tpeer num:%v", id, len(r.Prs))
 	r.maybeCommit()
 }
 
@@ -783,6 +831,10 @@ func (r *Raft) maybeCommit() bool {
 	newCommit := match[len(match)/2]
 	if newCommit != 0 && r.RaftLog.matchTerm(newCommit, r.Term) && newCommit > r.RaftLog.committed {
 		r.logger.Infof("maybeCommit update committedTo %v", newCommit)
+
+		t, _ := r.RaftLog.Term(newCommit)
+		log.Infof("Raft:%v\tupdate committedTo %v:%v", r.id, newCommit, t)
+
 		r.RaftLog.committedTo(newCommit)
 		return true
 	}

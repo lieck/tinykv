@@ -3,8 +3,6 @@ package raftstore
 import (
 	"bytes"
 	"fmt"
-	"time"
-
 	"github.com/Connor1996/badger"
 	"github.com/Connor1996/badger/y"
 	"github.com/golang/protobuf/proto"
@@ -20,6 +18,7 @@ import (
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/raft"
 	"github.com/pingcap/errors"
+	"time"
 )
 
 type ApplySnapResult struct {
@@ -322,7 +321,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
 	}
 
-	log.Infof("%v\tAppend\tlen:%v\tlastTerm:%v\tlastIdx:%v", ps.Tag, len(entries), last.Term, last.Index)
+	//log.Infof("%v\tAppend\tlen:%v\tlastTerm:%v\tlastIdx:%v", ps.Tag, len(entries), last.Term, last.Index)
 
 	ps.raftState.LastTerm = last.Term
 	ps.raftState.LastIndex = last.Index
@@ -342,19 +341,17 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
 
+	if !ps.validateSnap(snapshot) || snapData.Region.RegionEpoch.Version < ps.region.RegionEpoch.Version {
+		return nil, nil
+	}
+
 	ret := &ApplySnapResult{
 		PrevRegion: ps.region,
 		Region:     snapData.Region,
 	}
 
-	// 删除 kv 和 raft 的数据
-	ps.ClearData()
-	if err := ps.clearMeta(kvWB, raftWB); err != nil {
-		return nil, err
-	}
-
 	// 更新存储状态
-	ps.region = snapData.Region
+	ps.SetRegion(snapData.Region)
 	ps.snapState.StateType = snap.SnapState_Applying
 
 	ps.applyState.AppliedIndex = snapshot.Metadata.Index
@@ -364,7 +361,13 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.raftState.LastIndex = snapshot.Metadata.Index
 	ps.raftState.LastTerm = snapshot.Metadata.Term
 
-	log.Infof("%v\tApplySnapshot\tlastIdx:%v\tlastTerm:%v", ps.Tag, snapshot.Metadata.Index, snapshot.Metadata.Term)
+	// 删除 kv 和 raft 的数据
+	ps.ClearData()
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+
+	log.Infof("%v\tApplySnapshot\tlastIdx:%v\tlastTerm:%v\tRegion:%v", ps.Tag, snapshot.Metadata.Index, snapshot.Metadata.Term, snapData.Region.String())
 
 	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.Region().Id), ps.applyState); err != nil {
 		return nil, err
@@ -372,14 +375,14 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
 
 	ch := make(chan bool, 1)
-	ps.regionSched <- runner.RegionTaskApply{
+	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: snapData.Region.Id,
 		Notifier: ch,
 		SnapMeta: snapshot.Metadata,
 		StartKey: snapData.Region.StartKey,
 		EndKey:   snapData.Region.EndKey,
 	}
-
+	<-ch
 	return ret, nil
 }
 
@@ -404,10 +407,15 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 
 	if len(ready.Entries) > 0 {
-		if err = ps.Append(ready.Entries, &raftWB); err != nil {
-			return nil, err
+		last := ready.Entries[len(ready.Entries)-1]
+		if ps.raftState.LastIndex < last.Index {
+			if err = ps.Append(ready.Entries, &raftWB); err != nil {
+				return nil, err
+			}
+			ps.raftState.LastIndex = last.Index
+			ps.raftState.LastTerm = last.Term
+			raftState = true
 		}
-		raftState = true
 	}
 
 	//if len(ready.CommittedEntries) > 0 {
@@ -418,7 +426,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 		raftState = true
-		log.Infof("%v\tSaveReadyState\tcommIdx:%v", ps.Tag, ps.raftState.HardState.Commit)
+		//log.Infof("%v\tSaveReadyState\tcommIdx:%v", ps.Tag, ps.raftState.HardState.Commit)
 	}
 
 	if raftState {

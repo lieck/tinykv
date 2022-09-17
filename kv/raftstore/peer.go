@@ -109,6 +109,8 @@ type peer struct {
 	// It's updated everytime the split checker scan the data
 	// (Used in 3B split)
 	ApproximateSize *uint64
+
+	lastApplySplitIdx uint64
 }
 
 func NewPeer(storeId uint64, cfg *config.Config, engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task,
