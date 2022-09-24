@@ -213,7 +213,7 @@ func newRaft(c *Config) *Raft {
 
 	r.checkPendingConfIndex()
 
-	r.logger.Infof("new raft lastIndex:%v\tsnapshotIndex:%v", r.RaftLog.LastIndex(), r.RaftLog.snapshotIndex)
+	r.logger.Infof("new raft %v lastIndex:%v\tsnapshotIndex:%v", r.id, r.RaftLog.LastIndex(), r.RaftLog.snapshotIndex)
 
 	return r
 }
@@ -278,7 +278,7 @@ func (r *Raft) appendEntry(es []*pb.Entry) {
 
 	// 向其他节点发送消息
 	for i := range r.Prs {
-		if i == r.id {
+		if i == r.id || r.Prs[i].Next <= r.RaftLog.snapshotIndex {
 			continue
 		}
 		r.sendAppend(i)
@@ -312,6 +312,13 @@ func (r *Raft) sendAppend(to uint64) bool {
 		}
 		msg.Snapshot = &snapshot
 		log.Infof("Raft:%v\tsend Snapshot Metadata: %v\tTo:%v", r.id, msg.Snapshot.Metadata.String(), to)
+
+		r.Prs[to].Next = snapshot.Metadata.Index + 1
+
+		if r.RaftLog.snapshotIndex < snapshot.Metadata.Index {
+			r.RaftLog.snapshotIndex = snapshot.Metadata.Index
+			r.RaftLog.snapshotTerm = snapshot.Metadata.Term
+		}
 	} else {
 
 		msg.MsgType = pb.MessageType_MsgAppend
@@ -344,7 +351,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		}
 		msg.Commit = min(r.RaftLog.committed, max(r.Prs[to].Match, msgLastIdx))
 
-		log.Infof("Raft:%v\tsend Append\tIdx:%v\tTerm:%v\tLen:%v\tCommIdx:%v", r.id, msg.Index, msg.LogTerm, len(msg.Entries), msg.Commit)
+		log.Infof("Raft:%v\tsend %v Append\tIdx:%v\tTerm:%v\tLen:%v\tCommIdx:%v", r.id, to, msg.Index, msg.LogTerm, len(msg.Entries), msg.Commit)
 	}
 
 	r.send(msg)
@@ -650,15 +657,16 @@ func (r *Raft) handleAppendResp(m pb.Message) {
 			return
 		}
 
-		if m.LogTerm > 0 {
+		logTerm, err := r.RaftLog.Term(m.Index)
+		if err != nil && logTerm == m.LogTerm {
+
+		} else if m.LogTerm > 0 {
 			nextIdx = r.RaftLog.findConflictByTerm(m.Index, m.LogTerm)
 		}
 
 		prs.Next = max(1, nextIdx)
 		r.sendAppend(m.From)
 	} else {
-		// 判断是否为已删除节点的过期信息
-
 		log.Infof("Raft:%v\thandleAppendResp from:%v,  idx:%v", r.id, m.From, m.Index)
 
 		prs.Next = max(prs.Next, m.Index+1)
@@ -705,7 +713,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	msg := pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From}
 	metaData := m.Snapshot.Metadata
 
-	if r.RaftLog.LastIndex() < metaData.Index || !r.RaftLog.matchTerm(metaData.Index, metaData.Term) {
+	if r.RaftLog.snapshotIndex < metaData.Index {
 		r.RaftLog.pendingSnapshot = m.Snapshot
 		r.RaftLog.maybeCompact()
 

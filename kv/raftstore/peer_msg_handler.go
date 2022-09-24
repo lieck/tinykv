@@ -68,8 +68,13 @@ func (d *peerMsgHandler) applySplit(msg *raft_cmdpb.RaftCmdRequest) bool {
 		return false
 	}
 	if len(split.NewPeerIds) != len(d.Region().Peers) {
-		log.Infof("%v\tapplySplit\tPeers len err", d.Tag)
-		return false
+		if len(split.NewPeerIds) > len(d.Region().Peers) {
+			split.NewPeerIds = split.NewPeerIds[0:len(d.Region().Peers)]
+		} else {
+			return false
+		}
+		log.Infof("%v\tapplySplit\tPeers len err\tcurr:%v\tnew:%v", d.Tag, d.Region().Peers, split.NewPeerIds)
+		//return false
 	}
 	metaData := d.ctx.storeMeta
 	//metaData.Lock()
@@ -368,6 +373,10 @@ func (d *peerMsgHandler) applyEntryConfChange(e pb.Entry) bool {
 
 	d.RaftGroup.ApplyConfChange(cc)
 	d.notifyHeartbeatScheduler(d.Region(), d.peer)
+
+	if d.ticker.isOnTick(PeerTickSplitRegionCheck) {
+		d.onSplitRegionCheckTick()
+	}
 
 	log.Infof("%v\t%v", d.Tag, d.Region().String())
 	return true
@@ -669,7 +678,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	idx := d.nextProposalIndex()
 	for _, r := range msg.Requests {
 		if r.Put != nil || r.Delete != nil {
-			log.Infof("%vproposeRaftCommand idx:%v\t%v", d.Tag, idx, r.String())
+			log.Infof("%v\tproposeRaftCommand idx:%v\t%v", d.Tag, idx, r.String())
 		}
 	}
 
@@ -1099,6 +1108,7 @@ func (d *peerMsgHandler) validateSplitRegion(epoch *metapb.RegionEpoch, splitKey
 }
 
 func (d *peerMsgHandler) onApproximateRegionSize(size uint64) {
+	log.Infof("%v\tpeerMsgHandler\tupdate ApproximateSize:%v", d.Tag, &size)
 	d.ApproximateSize = &size
 }
 
