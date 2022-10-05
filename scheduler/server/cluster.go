@@ -16,6 +16,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"path"
 	"sync"
 	"time"
@@ -279,6 +280,45 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+
+	oldInfo := c.core.GetRegion(region.GetID())
+
+	// 判断版本号是否正确
+	if oldInfo != nil {
+		// 存在 Region ID
+		if util.IsEpochStale(region.GetRegionEpoch(), oldInfo.GetRegionEpoch()) {
+			return nil
+		}
+	} else {
+		// 不存在 Region ID， 扫描重叠的 key
+		for _, r := range c.core.Regions.GetOverlaps(region) {
+			if util.IsEpochStale(region.GetRegionEpoch(), r.GetRegionEpoch()) {
+				return nil
+			}
+		}
+	}
+
+	// 判断是否可以跳过更新
+	var update bool = oldInfo == nil
+	if !update {
+		// 比较版本号
+		oldMeta := oldInfo.GetRegionEpoch()
+		newMeta := region.GetMeta().GetRegionEpoch()
+		if oldMeta.ConfVer < newMeta.ConfVer || oldMeta.Version < newMeta.Version {
+			update = true
+		}
+
+		update = update || (oldInfo.GetLeader() != region.GetLeader())
+		update = update || (oldInfo.GetApproximateSize() != region.GetApproximateSize())
+
+	}
+
+	if !update {
+		return nil
+	}
+
+	// 更新
+	c.core.PutRegion(region)
 
 	return nil
 }

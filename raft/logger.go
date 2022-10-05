@@ -16,7 +16,7 @@ var (
 	// 1 ： info 等必要信息
 	// 2 ： debug 信息
 	// 3 ： debugX 信息
-	debugLv = 1
+	debugLv = 0
 
 	headDetails = true
 	writeFile   = false

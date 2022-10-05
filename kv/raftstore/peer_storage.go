@@ -122,6 +122,13 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 		return buf, nil
 	}
 	// Here means we don't fetch enough entries.
+	var firstIdx uint64
+	var lastIdx uint64
+	if len(buf) > 0 {
+		firstIdx = buf[0].Index
+		lastIdx = buf[len(buf)-1].Index
+	}
+	log.Infof("PeerStorage Entries err\t%v\tlen:%v\tfirst:%v\tlast:%v", ps.Tag, len(buf), firstIdx, lastIdx)
 	return nil, raft.ErrUnavailable
 }
 
@@ -408,20 +415,13 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 
 	if len(ready.Entries) > 0 {
 		last := ready.Entries[len(ready.Entries)-1]
-		if ps.raftState.LastIndex < last.Index {
-			if err = ps.Append(ready.Entries, &raftWB); err != nil {
-				return nil, err
-			}
-			ps.raftState.LastIndex = last.Index
-			ps.raftState.LastTerm = last.Term
-			raftState = true
+		if err = ps.Append(ready.Entries, &raftWB); err != nil {
+			return nil, err
 		}
+		ps.raftState.LastIndex = last.Index
+		ps.raftState.LastTerm = last.Term
+		raftState = true
 	}
-
-	//if len(ready.CommittedEntries) > 0 {
-	//	ps.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries) - 1].Index
-	//	log.Infof("SaveReadyState\tapplyIdx:%v", ps.applyState.AppliedIndex)
-	//}
 
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState

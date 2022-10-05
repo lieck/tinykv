@@ -165,6 +165,11 @@ type Raft struct {
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
 
+	// 判断是否应该发送快照
+	isSendSnap map[uint64]bool
+
+	// read index 的 quorum
+
 	logger *Logger
 }
 
@@ -278,7 +283,7 @@ func (r *Raft) appendEntry(es []*pb.Entry) {
 
 	// 向其他节点发送消息
 	for i := range r.Prs {
-		if i == r.id || r.Prs[i].Next <= r.RaftLog.snapshotIndex {
+		if i == r.id {
 			continue
 		}
 		r.sendAppend(i)
@@ -304,6 +309,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 	nextIndex := r.Prs[to].Next
 	preLogIndex := r.Prs[to].Next - 1
 	if nextIndex <= r.RaftLog.snapshotIndex {
+		if is, ok := r.isSendSnap[to]; ok && is {
+			return false
+		}
 
 		msg.MsgType = pb.MessageType_MsgSnapshot
 		snapshot, err := r.RaftLog.storage.Snapshot()
@@ -313,12 +321,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 		msg.Snapshot = &snapshot
 		log.Infof("Raft:%v\tsend Snapshot Metadata: %v\tTo:%v", r.id, msg.Snapshot.Metadata.String(), to)
 
-		r.Prs[to].Next = snapshot.Metadata.Index + 1
-
 		if r.RaftLog.snapshotIndex < snapshot.Metadata.Index {
 			r.RaftLog.snapshotIndex = snapshot.Metadata.Index
 			r.RaftLog.snapshotTerm = snapshot.Metadata.Term
 		}
+		r.isSendSnap[to] = true
 	} else {
 
 		msg.MsgType = pb.MessageType_MsgAppend
@@ -499,6 +506,7 @@ func (r *Raft) becomeLeader() {
 
 	r.leadTransferee = None
 	r.State = StateLeader
+	r.isSendSnap = make(map[uint64]bool)
 	r.reset(r.Term, r.id)
 
 	for i := range r.Prs {
@@ -550,8 +558,14 @@ func (r *Raft) Step(m pb.Message) error {
 	case StateLeader:
 		switch m.MsgType {
 		case pb.MessageType_MsgAppendResponse:
+			if _, ok := r.isSendSnap[m.From]; ok {
+				delete(r.isSendSnap, m.From)
+			}
 			r.handleAppendResp(m)
 		case pb.MessageType_MsgHeartbeatResponse:
+			if _, ok := r.isSendSnap[m.From]; ok {
+				delete(r.isSendSnap, m.From)
+			}
 			if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
 				r.sendAppend(m.From)
 			}
@@ -585,6 +599,7 @@ func (r *Raft) Step(m pb.Message) error {
 	case StateLeader:
 		switch m.MsgType {
 		case pb.MessageType_MsgBeat:
+			log.Infof("Raft:%v\tMessageType_MsgBeat", r.id)
 			for id, _ := range r.Prs {
 				if id == r.id {
 					continue
@@ -666,8 +681,8 @@ func (r *Raft) handleAppendResp(m pb.Message) {
 
 		prs.Next = max(1, nextIdx)
 		r.sendAppend(m.From)
-	} else {
-		log.Infof("Raft:%v\thandleAppendResp from:%v,  idx:%v", r.id, m.From, m.Index)
+	} else if prs.Match < m.Index {
+		log.Infof("Raft:%v\thandleAppendResp\tfrom:%v\t(Idx:%v, T:%v)", r.id, m.From, m.Index, m.LogTerm)
 
 		prs.Next = max(prs.Next, m.Index+1)
 		prs.Match = max(prs.Match, m.Index)
@@ -713,22 +728,21 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	msg := pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From}
 	metaData := m.Snapshot.Metadata
 
-	if r.RaftLog.snapshotIndex < metaData.Index {
-		r.RaftLog.pendingSnapshot = m.Snapshot
-		r.RaftLog.maybeCompact()
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.RaftLog.maybeCompact()
 
-		r.Prs = map[uint64]*Progress{}
-		for _, id := range metaData.ConfState.Nodes {
-			r.Prs[id] = &Progress{}
-		}
-
-		log.Infof("Raft:%v\tApplySnapshot metaData:%v\tcurrLastIdx:%v", r.id, metaData.String(), r.RaftLog.snapshotIndex)
+	r.Prs = map[uint64]*Progress{}
+	for _, id := range metaData.ConfState.Nodes {
+		r.Prs[id] = &Progress{}
 	}
 
-	msg.Index = r.RaftLog.LastIndex()
+	log.Infof("Raft:%v\tApplySnapshot metaData:%v\tcurrLastIdx:%v", r.id, metaData.String(), r.RaftLog.snapshotIndex)
 
-	log.Infof("Raft:%v\thandleSnapshot r(Idx:%v, T:%v) s(Idx:%v)", r.id,
-		metaData.Index, metaData.Term, r.RaftLog.LastIndex())
+	msg.Index = metaData.Index
+	msg.LogTerm = metaData.Term
+
+	log.Infof("Raft:%v\thandleSnapshot r(Idx:%v, T:%v) s(Idx:%v, T:%v)", r.id,
+		metaData.Index, metaData.Term, msg.Index, msg.LogTerm)
 
 	r.send(msg)
 }
@@ -761,12 +775,6 @@ func (r *Raft) handleVoteResp(m pb.Message) {
 			r.votesRejected++
 		} else {
 			r.votesGranted++
-		}
-
-		if !m.Reject {
-			r.logger.Infof("收到 %v 的选举同意票", m.From)
-		} else {
-			r.logger.DebugfX("收到 %v 的选举回复", m.From)
 		}
 
 		quorum := len(r.Prs) / 2

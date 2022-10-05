@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
+	"sort"
 )
 
 func init() {
@@ -77,6 +78,108 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
+	var suitableStores []*core.StoreInfo
+	for _, s := range cluster.GetStores() {
+		if s.DownTime() < cluster.GetMaxStoreDownTime() {
+			suitableStores = append(suitableStores, s)
+		}
+	}
 
-	return nil
+	sort.Slice(suitableStores, func(i, j int) bool {
+		return suitableStores[i].GetRegionSize() > suitableStores[j].GetLeaderSize()
+	})
+
+	region := &core.RegionInfo{}
+	for _, s := range suitableStores {
+		cluster.GetPendingRegionsWithLock(s.GetID(), func(container core.RegionsContainer) {
+			if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
+				region = r
+			}
+		})
+		if region != nil {
+			break
+		}
+
+		cluster.GetFollowersWithLock(s.GetID(), func(container core.RegionsContainer) {
+			if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
+				region = r
+			}
+		})
+		if region != nil {
+			break
+		}
+
+		cluster.GetLeadersWithLock(s.GetID(), func(container core.RegionsContainer) {
+			if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
+				region = r
+			}
+		})
+		if region != nil {
+			break
+		}
+	}
+
+	if region == nil || len(region.GetPeers()) < cluster.GetMaxReplicas() {
+		return nil
+	}
+
+	var storeTo uint64
+	var storeIs bool
+	for i := len(suitableStores) - 1; i >= 0; i-- {
+		sId := suitableStores[i].GetID()
+		var is bool = true
+		if _, ok := region.GetStoreIds()[sId]; ok {
+			is = false
+			break
+		}
+		if is {
+			storeIs = true
+			storeTo = sId
+		}
+	}
+
+	if !storeIs {
+		return nil
+	}
+
+	var storeForm uint64
+	var storeFormSize int64
+	for sId := range region.GetStoreIds() {
+		if sId != storeTo && cluster.GetStore(sId).GetRegionSize() > storeFormSize {
+			storeForm = sId
+		}
+	}
+
+	var storeToSize int64 = cluster.GetStore(storeForm).GetRegionSize()
+
+	var cSize int64
+	if storeToSize >= storeFormSize {
+		cSize = storeToSize - storeFormSize
+	} else {
+		cSize = storeFormSize - storeToSize
+	}
+
+	if cSize < cluster.GetAverageRegionSize()*2 {
+		return nil
+	}
+
+	peer, err := cluster.AllocPeer(storeTo)
+	if err != nil {
+		panic(err)
+	}
+
+	peerOperator, err := operator.CreateMovePeerOperator(
+		"",
+		cluster,
+		region,
+		operator.OpRange,
+		storeForm,
+		storeTo,
+		peer.Id,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	return peerOperator
 }

@@ -81,7 +81,7 @@ func newLog(storage Storage) *RaftLog {
 
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
-		entries = []pb.Entry{}
+		panic(err)
 	}
 
 	var snapshotIndex uint64 = 0
@@ -172,8 +172,11 @@ func (l *RaftLog) LastIndex() uint64 {
 	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
-func (l *RaftLog) lastTerm(i uint64) uint64 {
-	ret, _ := l.Term(i)
+func (l *RaftLog) getTerm(i uint64) uint64 {
+	ret, err := l.Term(i)
+	if err != nil {
+		panic(err)
+	}
 	return ret
 }
 
