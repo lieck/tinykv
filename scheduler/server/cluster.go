@@ -281,44 +281,124 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
 
-	oldInfo := c.core.GetRegion(region.GetID())
+	if region == nil || region.GetRegionEpoch() == nil {
+		return nil
+	}
 
-	// 判断版本号是否正确
-	if oldInfo != nil {
+	// check update
+	oldRegion := c.core.GetRegion(region.GetID())
+	if oldRegion != nil {
 		// 存在 Region ID
-		if util.IsEpochStale(region.GetRegionEpoch(), oldInfo.GetRegionEpoch()) {
+		if util.IsEpochStale(region.GetRegionEpoch(), oldRegion.GetRegionEpoch()) {
+			return ErrRegionIsStale(region.GetMeta(), oldRegion.GetMeta())
+		}
+
+		if !CheckRegionNew(oldRegion, region) {
 			return nil
 		}
 	} else {
 		// 不存在 Region ID， 扫描重叠的 key
-		for _, r := range c.core.Regions.GetOverlaps(region) {
+		for _, r := range c.core.GetOverlaps(region) {
 			if util.IsEpochStale(region.GetRegionEpoch(), r.GetRegionEpoch()) {
-				return nil
+				return ErrRegionIsStale(region.GetMeta(), nil)
 			}
 		}
 	}
 
-	// 判断是否可以跳过更新
-	var update bool = oldInfo == nil
-	if !update {
-		// 比较版本号
-		oldMeta := oldInfo.GetRegionEpoch()
-		newMeta := region.GetMeta().GetRegionEpoch()
-		if oldMeta.ConfVer < newMeta.ConfVer || oldMeta.Version < newMeta.Version {
-			update = true
+	type updateStore struct {
+		storeId          uint64
+		leaderCount      int
+		regionCount      int
+		leaderSize       int64
+		regionSize       int64
+		pendingPeerCount int
+	}
+
+	// Init
+	updateStoresMap := map[uint64]*updateStore{}
+	if oldRegion != nil {
+		for _, p := range oldRegion.GetPeers() {
+			updateStoresMap[p.StoreId] = &updateStore{
+				storeId: p.StoreId,
+			}
+		}
+	}
+	for _, p := range region.GetPeers() {
+		if _, ok := updateStoresMap[p.StoreId]; !ok {
+			updateStoresMap[p.StoreId] = &updateStore{
+				storeId: p.StoreId,
+			}
+		}
+	}
+
+	// update leader
+	if oldRegion == nil || oldRegion.GetLeader() != region.GetLeader() {
+		if oldRegion != nil && oldRegion.GetLeader() != nil {
+			updateStoresMap[oldRegion.GetLeader().StoreId].leaderSize -= oldRegion.GetApproximateSize()
+			updateStoresMap[oldRegion.GetLeader().StoreId].leaderCount--
+		}
+		if region.GetLeader() != nil {
+			updateStoresMap[region.GetLeader().StoreId].leaderSize += region.GetApproximateSize()
+			updateStoresMap[region.GetLeader().StoreId].leaderCount++
+		}
+	}
+
+	// update regionCount
+	if oldRegion != nil {
+		for _, p := range oldRegion.GetPeers() {
+			updateStoresMap[p.StoreId].regionCount--
+		}
+	}
+	for _, p := range region.GetPeers() {
+		updateStoresMap[p.StoreId].regionCount++
+	}
+
+	// update pendingPeerCount
+	if oldRegion != nil {
+		for _, p := range oldRegion.GetPendingPeers() {
+			updateStoresMap[p.StoreId].pendingPeerCount--
+		}
+	}
+	for _, p := range region.GetPendingPeers() {
+		updateStoresMap[p.StoreId].pendingPeerCount++
+	}
+
+	// update regionSize
+	if oldRegion != nil {
+		for _, p := range oldRegion.GetPeers() {
+			updateStoresMap[p.StoreId].regionSize -= oldRegion.GetApproximateSize()
+		}
+	}
+	for _, p := range region.GetPeers() {
+		updateStoresMap[p.StoreId].regionSize += region.GetApproximateSize()
+	}
+
+	c.core.Lock()
+	defer c.core.Unlock()
+	c.core.Regions.SetRegion(region)
+	for _, up := range updateStoresMap {
+		if up.leaderSize == 0 && up.regionCount == 0 && up.leaderCount == 0 && up.pendingPeerCount == 0 && up.regionSize == 0 {
+			continue
+		}
+		storeInfo := c.core.Stores.GetStore(up.storeId)
+		if storeInfo != nil {
+			up.leaderCount += storeInfo.GetLeaderCount()
+			up.regionSize += storeInfo.GetRegionSize()
+			up.regionCount += storeInfo.GetRegionCount()
+			up.leaderSize += storeInfo.GetLeaderSize()
+			up.pendingPeerCount += storeInfo.GetPendingPeerCount()
 		}
 
-		update = update || (oldInfo.GetLeader() != region.GetLeader())
-		update = update || (oldInfo.GetApproximateSize() != region.GetApproximateSize())
+		//fmt.Printf("update cluster storeInfo:%v\tleaderCount:%v\tregionSize:%v\tregionCount:%v\tleaderSize:%v\tpendingPeerCount:%v\n",
+		//	up.storeId,
+		//	up.leaderCount,
+		//	up.regionSize,
+		//	up.regionCount,
+		//	up.leaderSize,
+		//	up.pendingPeerCount)
 
+		c.core.Stores.UpdateStoreStatus(up.storeId, up.leaderCount, up.regionCount, up.pendingPeerCount, up.leaderSize, up.regionSize)
 	}
-
-	if !update {
-		return nil
-	}
-
-	// 更新
-	c.core.PutRegion(region)
 
 	return nil
 }

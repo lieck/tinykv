@@ -78,6 +78,8 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
+
+	// 获取 down 时间不能超过集群的 MaxStoreDownTime 的 store
 	var suitableStores []*core.StoreInfo
 	for _, s := range cluster.GetStores() {
 		if s.DownTime() < cluster.GetMaxStoreDownTime() {
@@ -85,37 +87,53 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 		}
 	}
 
+	// region 大小排序
 	sort.Slice(suitableStores, func(i, j int) bool {
-		return suitableStores[i].GetRegionSize() > suitableStores[j].GetLeaderSize()
+		return suitableStores[i].GetRegionSize() > suitableStores[j].GetRegionSize()
 	})
 
-	region := &core.RegionInfo{}
-	for _, s := range suitableStores {
-		cluster.GetPendingRegionsWithLock(s.GetID(), func(container core.RegionsContainer) {
-			if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
-				region = r
-			}
-		})
-		if region != nil {
-			break
+	// 根据 regionSize 找 region
+	var region *core.RegionInfo = nil
+	for i := 0; i < len(suitableStores) && region == nil; i++ {
+		s := suitableStores[i]
+		if i > 0 && suitableStores[i-1].GetRegionSize() == s.GetRegionSize() {
+			continue
 		}
 
-		cluster.GetFollowersWithLock(s.GetID(), func(container core.RegionsContainer) {
-			if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
-				region = r
+		for j := i; j < len(suitableStores) && region == nil; j++ {
+			ss := suitableStores[j]
+			if s.GetRegionSize() != ss.GetRegionSize() {
+				break
 			}
-		})
-		if region != nil {
-			break
+			cluster.GetPendingRegionsWithLock(ss.GetID(), func(container core.RegionsContainer) {
+				if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
+					region = r
+				}
+			})
 		}
 
-		cluster.GetLeadersWithLock(s.GetID(), func(container core.RegionsContainer) {
-			if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
-				region = r
+		for j := i; j < len(suitableStores) && region == nil; j++ {
+			ss := suitableStores[j]
+			if s.GetRegionSize() != ss.GetRegionSize() {
+				break
 			}
-		})
-		if region != nil {
-			break
+			cluster.GetFollowersWithLock(ss.GetID(), func(container core.RegionsContainer) {
+				if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
+					region = r
+				}
+			})
+		}
+
+		for j := i; j < len(suitableStores) && region == nil; j++ {
+			ss := suitableStores[j]
+			if s.GetRegionSize() != ss.GetRegionSize() {
+				break
+			}
+			cluster.GetLeadersWithLock(ss.GetID(), func(container core.RegionsContainer) {
+				if r := container.RandomRegion([]byte{}, []byte{}); r != nil {
+					region = r
+				}
+			})
 		}
 	}
 
@@ -123,18 +141,19 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 		return nil
 	}
 
+	// 寻找最小的 store
 	var storeTo uint64
-	var storeIs bool
+	var storeIs bool = false
 	for i := len(suitableStores) - 1; i >= 0; i-- {
+		// region 是否存在 peer 在 store 中
 		sId := suitableStores[i].GetID()
-		var is bool = true
-		if _, ok := region.GetStoreIds()[sId]; ok {
-			is = false
-			break
+		if suitableStores[i].IsOffline() {
+			continue
 		}
-		if is {
+		if _, ok := region.GetStoreIds()[sId]; !ok {
 			storeIs = true
 			storeTo = sId
+			break
 		}
 	}
 
@@ -142,37 +161,36 @@ func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operato
 		return nil
 	}
 
+	// 从 region 中找最大的 store
 	var storeForm uint64
 	var storeFormSize int64
 	for sId := range region.GetStoreIds() {
 		if sId != storeTo && cluster.GetStore(sId).GetRegionSize() > storeFormSize {
 			storeForm = sId
+			storeFormSize = cluster.GetStore(sId).GetRegionSize()
 		}
 	}
 
-	var storeToSize int64 = cluster.GetStore(storeForm).GetRegionSize()
+	var storeToSize int64 = cluster.GetStore(storeTo).GetRegionSize()
 
-	var cSize int64
-	if storeToSize >= storeFormSize {
-		cSize = storeToSize - storeFormSize
-	} else {
-		cSize = storeFormSize - storeToSize
-	}
-
+	// 判断 storeForm Size 和 storeTo 的差是否大于 2 * GetAverageRegionSize
+	var cSize int64 = storeFormSize - storeToSize
 	if cSize < cluster.GetAverageRegionSize()*2 {
 		return nil
 	}
 
+	// 创建 peer
 	peer, err := cluster.AllocPeer(storeTo)
 	if err != nil {
 		panic(err)
 	}
 
+	// 移动
 	peerOperator, err := operator.CreateMovePeerOperator(
 		"",
 		cluster,
 		region,
-		operator.OpRange,
+		operator.OpBalance,
 		storeForm,
 		storeTo,
 		peer.Id,

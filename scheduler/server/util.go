@@ -16,6 +16,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
+	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"math/rand"
 	"net/http"
 	"time"
@@ -155,4 +157,67 @@ func InitHTTPClient(svr *Server) error {
 		},
 	}
 	return nil
+}
+
+func checkPeersSame(old []*metapb.Peer, new []*metapb.Peer) bool {
+	if len(old) != len(new) {
+		return true
+	}
+
+	mp := map[uint64]*metapb.Peer{}
+	for _, p := range old {
+		mp[p.Id] = p
+	}
+
+	for _, p := range new {
+		if np, ok := mp[p.Id]; ok {
+			if np.StoreId != p.StoreId {
+				return true
+			}
+		} else {
+			return true
+		}
+	}
+
+	return false
+}
+
+func CheckRegionNew(old *core.RegionInfo, new *core.RegionInfo) bool {
+	if new.GetMeta().RegionEpoch.Version > old.GetMeta().RegionEpoch.Version {
+		return true
+	}
+
+	if new.GetMeta().RegionEpoch.ConfVer > old.GetMeta().RegionEpoch.ConfVer {
+		return true
+	}
+
+	if new.GetLeader().StoreId != old.GetLeader().StoreId {
+		return true
+	}
+
+	if new.GetLeader().Id != old.GetLeader().Id {
+		return true
+	}
+
+	if new.GetApproximateSize() != old.GetApproximateSize() {
+		return true
+	}
+
+	if checkPeersSame(old.GetPeers(), new.GetPeers()) {
+		return true
+	}
+
+	if checkPeersSame(old.GetPendingPeers(), new.GetPendingPeers()) {
+		return true
+	}
+
+	if checkPeersSame(old.GetVoters(), new.GetVoters()) {
+		return true
+	}
+
+	if checkPeersSame(old.GetLearners(), new.GetLearners()) {
+		return true
+	}
+
+	return false
 }
