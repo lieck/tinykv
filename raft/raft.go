@@ -638,6 +638,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		msg.Index = r.RaftLog.LastIndex()
 
 		committedIdx := min(m.Commit, r.RaftLog.LastIndex())
+		committedIdx = min(committedIdx, m.Index+uint64(len(m.Entries)))
 		r.RaftLog.committedTo(committedIdx)
 
 		log.Infof("Raft:%v\thandleAppendEntries r(Idx:%v, T:%v, Len:%v) s(Idx:%v) cuurCom:%v", r.id,
@@ -647,6 +648,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		msg.Reject = true
 		index := min(m.Index, r.RaftLog.LastIndex())
 		index = r.RaftLog.findConflictByTerm(index, m.LogTerm)
+		index = max(index, r.RaftLog.committed)
 		msg.Index = index
 		msg.LogTerm, _ = r.RaftLog.Term(index)
 
@@ -728,15 +730,17 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	msg := pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From}
 	metaData := m.Snapshot.Metadata
 
-	r.RaftLog.pendingSnapshot = m.Snapshot
-	r.RaftLog.maybeCompact()
+	if r.RaftLog.committed < metaData.Index {
+		r.RaftLog.pendingSnapshot = m.Snapshot
+		r.RaftLog.maybeCompact()
 
-	r.Prs = map[uint64]*Progress{}
-	for _, id := range metaData.ConfState.Nodes {
-		r.Prs[id] = &Progress{}
+		r.Prs = map[uint64]*Progress{}
+		for _, id := range metaData.ConfState.Nodes {
+			r.Prs[id] = &Progress{}
+		}
+
+		log.Infof("Raft:%v\tApplySnapshot metaData:%v\tcurrLastIdx:%v", r.id, metaData.String(), r.RaftLog.snapshotIndex)
 	}
-
-	log.Infof("Raft:%v\tApplySnapshot metaData:%v\tcurrLastIdx:%v", r.id, metaData.String(), r.RaftLog.snapshotIndex)
 
 	msg.Index = metaData.Index
 	msg.LogTerm = metaData.Term
