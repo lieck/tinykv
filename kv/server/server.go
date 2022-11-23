@@ -194,7 +194,7 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 			return nil, err
 		}
 		if w != nil {
-			if w.Kind == mvcc.WriteKindDelete || w.Kind == mvcc.WriteKindRollback {
+			if w.Kind == mvcc.WriteKindRollback {
 				return &kvrpcpb.CommitResponse{
 					Error: &kvrpcpb.KeyError{
 						Abort: "true",
